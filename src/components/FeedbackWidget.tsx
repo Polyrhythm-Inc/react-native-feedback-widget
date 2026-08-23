@@ -15,6 +15,13 @@ import {
 import ViewShot, { captureRef } from 'react-native-view-shot';
 import { FeedbackService } from '../services/feedback';
 import { AnnotationEditor } from './AnnotationEditor';
+import { SimpleFeedbackPanel } from './SimpleFeedbackPanel';
+import { resolveFeedbackWidgetVariant } from '../utils/feedbackWidgetMode';
+
+// Module-scope flag: once the simple-mode panel's switch gesture fires, the
+// full widget stays unlocked for the rest of the JS session (mirrors the
+// web version's sessionStorage-backed flag, without persisting to disk).
+let simpleModeUnlockedToFull = false;
 
 type FeedbackState =
   | 'idle'
@@ -31,17 +38,59 @@ interface FeedbackWidgetProps {
   widgetProjectId?: string;
   authUrl?: string;
   appTitle?: string;
+  mode?: 'simple' | 'full';
   children: React.ReactNode;
 }
 
+/**
+ * Public entry point. Defaults to the full feedback experience (screenshot
+ * capture, annotation, optional login) so existing consumers are unaffected.
+ * `mode="simple"` renders the lightweight good/bad rating panel instead,
+ * until its header-title switch gesture (5 taps within 2s) unlocks the full
+ * widget for the rest of the session.
+ */
 export function FeedbackWidget({
+  mode = 'full',
+  ...rest
+}: FeedbackWidgetProps) {
+  const { apiUrl, projectId, authUrl, appTitle, children } = rest;
+  const [switchedToFull, setSwitchedToFull] = useState(
+    simpleModeUnlockedToFull,
+  );
+  const showSimplePanel =
+    resolveFeedbackWidgetVariant(mode, switchedToFull) === 'simple';
+
+  useEffect(() => {
+    if (showSimplePanel) {
+      FeedbackService.configure({ apiUrl, projectId, authUrl, appTitle });
+    }
+  }, [showSimplePanel, apiUrl, projectId, authUrl, appTitle]);
+
+  if (showSimplePanel) {
+    return (
+      <SimpleFeedbackPanel
+        projectId={projectId}
+        onSwitchToFull={() => {
+          simpleModeUnlockedToFull = true;
+          setSwitchedToFull(true);
+        }}
+      >
+        {children}
+      </SimpleFeedbackPanel>
+    );
+  }
+
+  return <FullFeedbackWidget {...rest} />;
+}
+
+function FullFeedbackWidget({
   apiUrl,
   projectId,
   widgetProjectId,
   authUrl,
   appTitle,
   children,
-}: FeedbackWidgetProps) {
+}: Omit<FeedbackWidgetProps, 'mode'>) {
   const viewShotRef = useRef<ViewShot>(null);
   const [state, setState] = useState<FeedbackState>('idle');
   const [screenshotBase64, setScreenshotBase64] = useState<string | null>(null);

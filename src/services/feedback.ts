@@ -9,6 +9,21 @@ interface FeedbackConfig {
   appTitle?: string;
 }
 
+export interface TrackEventInput {
+  eventType: string;
+  projectId?: string;
+  targetType?: string;
+  targetId?: string;
+  rating?: 'good' | 'bad' | number;
+  reason?: string;
+  fields?: Record<string, unknown>;
+}
+
+interface TrackEventResponse {
+  success: boolean;
+  id: string;
+}
+
 interface SessionInfo {
   sessionId: string;
   platform: string;
@@ -335,5 +350,36 @@ export const FeedbackService = {
       } catch { /* ignore */ }
       throw new Error(detail || `Feedback submission failed: ${response.status}`);
     }
+  },
+
+  async trackEvent(input: TrackEventInput): Promise<TrackEventResponse> {
+    if (!config) throw new Error('FeedbackService not configured');
+
+    const body: Record<string, unknown> = {
+      projectId: input.projectId ?? config.projectId,
+      eventType: input.eventType,
+      targetType: input.targetType,
+      targetId: input.targetId,
+      rating: input.rating,
+      reason: input.reason,
+      fields: input.fields,
+    };
+
+    const response = await fetchWithTimeout(`${config.apiUrl}/api/events`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+
+    if (!response.ok) {
+      let detail = '';
+      try {
+        const errorData = await response.json();
+        detail = errorData.error || errorData.message || '';
+      } catch { /* ignore */ }
+      throw new Error(detail || `Event submission failed: ${response.status}`);
+    }
+
+    return response.json();
   },
 };
