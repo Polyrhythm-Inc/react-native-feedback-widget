@@ -47,6 +47,7 @@ export default function App() {
 | `authUrl` | string | | 認証サーバー URL。指定時はログイン必須 |
 | `appTitle` | string | | スクリーンショット送信時の pageInfo.title（デフォルト: `"App"`） |
 | `mode` | `'simple' \| 'full'` | | `'simple'` で軽量な good/bad 評価パネルに切り替え。省略時は `'full'`（従来の挙動と完全互換） |
+| `enableScreenshot` | boolean | | `false` にすると FAB タップ時の自動スクリーンショット撮影・注釈・プレビュー表示をスキップし、コメントのみでフィードバックを送信できる（デフォルト `true`、従来通りの自動スクショ挙動） |
 
 ## 簡易モード（`mode="simple"`）
 

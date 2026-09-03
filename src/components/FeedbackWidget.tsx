@@ -39,6 +39,12 @@ interface FeedbackWidgetProps {
   authUrl?: string;
   appTitle?: string;
   mode?: 'simple' | 'full';
+  /**
+   * When `false`, skips automatic screenshot capture (and annotation) on FAB
+   * tap / post-login, letting users submit comment-only feedback. Defaults
+   * to `true` to preserve existing behavior.
+   */
+  enableScreenshot?: boolean;
   children: React.ReactNode;
 }
 
@@ -89,6 +95,7 @@ function FullFeedbackWidget({
   widgetProjectId,
   authUrl,
   appTitle,
+  enableScreenshot = true,
   children,
 }: Omit<FeedbackWidgetProps, 'mode'>) {
   const viewShotRef = useRef<ViewShot>(null);
@@ -132,6 +139,12 @@ function FullFeedbackWidget({
       return;
     }
 
+    if (!enableScreenshot) {
+      setScreenshotBase64(null);
+      setState('preview');
+      return;
+    }
+
     setState('capturing');
     const uri = await captureScreenshot();
     if (uri) {
@@ -141,7 +154,7 @@ function FullFeedbackWidget({
       setState('idle');
       Alert.alert('Error', 'Failed to capture screenshot');
     }
-  }, [captureScreenshot]);
+  }, [captureScreenshot, enableScreenshot]);
 
   const handleLogin = useCallback(async () => {
     if (!email.trim() || !password.trim()) {
@@ -155,13 +168,18 @@ function FullFeedbackWidget({
       if (error === null) {
         setEmail('');
         setPassword('');
-        setState('capturing');
-        const uri = await captureScreenshot();
-        if (uri) {
-          setScreenshotBase64(uri);
+        if (!enableScreenshot) {
+          setScreenshotBase64(null);
           setState('preview');
         } else {
-          setState('idle');
+          setState('capturing');
+          const uri = await captureScreenshot();
+          if (uri) {
+            setScreenshotBase64(uri);
+            setState('preview');
+          } else {
+            setState('idle');
+          }
         }
       } else {
         Alert.alert('Login Failed', error);
@@ -171,7 +189,7 @@ function FullFeedbackWidget({
     } finally {
       setLoginLoading(false);
     }
-  }, [email, password, captureScreenshot]);
+  }, [email, password, captureScreenshot, enableScreenshot]);
 
   const handleAnnotate = useCallback(() => {
     setState('annotating');
