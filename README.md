@@ -104,4 +104,4 @@ npm run typecheck
 
 ## ロールアウト
 
-インストール先カタログ・更新手順は [../../docs/widget-installations.md](../../docs/widget-installations.md) を参照。
+インストール先カタログ・更新手順は [/Users/yunoki/Dropbox/project/test-suite/docs/widget-installations.md](/Users/yunoki/Dropbox/project/test-suite/docs/widget-installations.md) を参照。
