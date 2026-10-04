@@ -104,4 +104,4 @@ npm run typecheck
 
 ## ロールアウト
 
-インストール先カタログ・更新手順は [../../docs/widget-installations.md](../../docs/widget-installations.md) を参照。
+インストール先カタログ・更新手順は [https://github.com/Polyrhythm-Inc/test-suite-docs/blob/main/docs/widget-installations.md](https://github.com/Polyrhythm-Inc/test-suite-docs/blob/main/docs/widget-installations.md) を参照。

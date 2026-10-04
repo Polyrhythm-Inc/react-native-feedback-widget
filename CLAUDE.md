@@ -8,7 +8,7 @@ React Native 用フィードバックウィジェット。GitHub リポジトリ
 
 ウィジェット側を変更した場合のロールアウト手順・反映先は以下を参照:
 
-**[../../docs/widget-installations.md](../../docs/widget-installations.md)**
+**[https://github.com/Polyrhythm-Inc/test-suite-docs/blob/main/docs/widget-installations.md](https://github.com/Polyrhythm-Inc/test-suite-docs/blob/main/docs/widget-installations.md)**
 
 ## 開発
 
@@ -21,4 +21,4 @@ React Native 用フィードバックウィジェット。GitHub リポジトリ
 2. `git push origin main`
 3. 各アプリで `npm update @polyrhythm-inc/react-native-feedback-widget`（または `package-lock.json` の該当 commit を更新して `npm install`）
 
-インストール先アプリ一覧は [widget-installations.md](../../docs/widget-installations.md#react-native-widget) 参照。
+インストール先アプリ一覧は [widget-installations.md](https://github.com/Polyrhythm-Inc/test-suite-docs/blob/main/docs/widget-installations.md#react-native-widget) 参照。
