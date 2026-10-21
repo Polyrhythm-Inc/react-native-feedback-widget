@@ -12,7 +12,8 @@ React Native 用フィードバックウィジェット。GitHub リポジトリ
 
 ## 技術スタック
 
-- TypeScript（`strict: true`）/ React Native 0.81 / React 19
+- TypeScript（`strict: true`）
+- 開発環境: React Native 0.81 / React 19（利用側の対応範囲は peerDependencies: `react-native >=0.72` / `react >=18`）
 - テスト: Jest（preset `jest-expo`）
 - リンター: ESLint 9（flat config、`eslint-config-expo`）
 
