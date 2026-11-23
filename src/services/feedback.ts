@@ -43,12 +43,39 @@ const AUTH_REFRESH_TOKEN_KEY = 'feedback-widget-auth:refreshToken';
 const AUTH_EXPIRES_AT_KEY = 'feedback-widget-auth:expiresAt';
 const REQUEST_TIMEOUT_MS = 15_000;
 const REFRESH_BUFFER_SECONDS = 300;
+/** 429 / 一時エラー時の最大再試行回数 */
+const MAX_REFRESH_RETRIES = 3;
+/** 1 回の待機の上限(ms)。Retry-After が大きくてもこれを超えて待たない */
+const MAX_RETRY_WAIT_MS = 30_000;
+/** Retry-After が無い場合の指数バックオフの基準(ms): 1s, 2s, 4s */
+const BACKOFF_BASE_MS = 1_000;
+/** 再試行を使い切った後に、改めて refresh を試みるまでの待機(ms) */
+const TRANSIENT_RESCHEDULE_MS = 60_000;
+/** 一時的な失敗が続いた場合の再スケジュール通算回数の上限(成功でリセット)。超えたら自動再試行を止める */
+const MAX_TRANSIENT_RESCHEDULES = 5;
+
+/**
+ * ok: 更新済み / invalid: 401 などの直らない 4xx で token を消した /
+ * transient: 429・408・5xx・ネットワーク断など一時的な失敗(token は保持) /
+ * aborted: 通信中にログアウト・再ログインがあり、結果を保存せず中止(ストレージには触らない)、または更新できる token が無い
+ */
+type RefreshOutcome = 'ok' | 'invalid' | 'transient' | 'aborted';
 
 const appStartTime = Date.now();
 
 let config: FeedbackConfig | null = null;
 let accessToken: string | null = null;
 let refreshTimerId: ReturnType<typeof setTimeout> | null = null;
+/** logout・再ログインで増やす世代番号。進行中の refresh が古い世代の結果を保存・消去しないために使う */
+let generation = 0;
+let transientReschedules = 0;
+/** 進行中の refresh。タイマー・起動時の復元・configure の再呼び出しが重なっても、API は 1 本にまとめる */
+let refreshInFlight: { gen: number; promise: Promise<RefreshOutcome> } | null = null;
+
+/** 再試行で回復しうる HTTP ステータス(429・408・5xx)。これ以外の 4xx は再試行しない */
+function isTransientStatus(status: number | undefined): boolean {
+  return status === 429 || status === 408 || (status !== undefined && status >= 500);
+}
 
 function generateUUID(): string {
   return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
@@ -119,38 +146,122 @@ async function loadSavedAuth(): Promise<void> {
   }
 }
 
-async function performRefresh(): Promise<boolean> {
-  if (!config?.authUrl) return false;
+/**
+ * 待機時間(ms)。Retry-After ヘッダ(秒)を優先し、無ければ 429 本文の retryAfter(秒)、
+ * それも無い・不正(負値・非数・非有限)なら指数バックオフ。上限は MAX_RETRY_WAIT_MS。
+ */
+async function computeWaitMs(response: Response | null, attempt: number): Promise<number> {
+  const header = response?.headers?.get('Retry-After');
+  if (header && /^\d+$/.test(header.trim())) {
+    return Math.min(parseInt(header.trim(), 10) * 1000, MAX_RETRY_WAIT_MS);
+  }
+  if (response?.status === 429) {
+    try {
+      const body: unknown = await response.json();
+      const sec = (body as { retryAfter?: unknown } | null)?.retryAfter;
+      if (typeof sec === 'number' && Number.isFinite(sec) && sec >= 0) {
+        return Math.min(Math.ceil(sec) * 1000, MAX_RETRY_WAIT_MS);
+      }
+    } catch { /* 本文なし・JSON 以外 */ }
+  }
+  return Math.min(BACKOFF_BASE_MS * 2 ** attempt, MAX_RETRY_WAIT_MS);
+}
 
-  try {
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * token を更新する。同じ世代で進行中の refresh があればその結果を共有する(多重実行しない)。
+ * 401 などの直らない 4xx のときだけ token を消す。429・408・5xx・ネットワーク断では token を保持し、
+ * 待って再試行する。通信中にログアウト・再ログインがあれば、結果を保存も消去もせず中止する。
+ */
+function performRefresh(): Promise<RefreshOutcome> {
+  if (!config?.authUrl) return Promise.resolve('aborted');
+
+  const gen = generation;
+  if (refreshInFlight && refreshInFlight.gen === gen) return refreshInFlight.promise;
+
+  const promise: Promise<RefreshOutcome> = refreshWithRetries(gen)
+    // ストレージ障害などの想定外の例外では token を消さず、一時的な失敗として扱う
+    .catch((): RefreshOutcome => 'transient')
+    .finally(() => {
+      if (refreshInFlight?.promise === promise) refreshInFlight = null;
+    });
+  refreshInFlight = { gen, promise };
+  return promise;
+}
+
+async function refreshWithRetries(gen: number): Promise<RefreshOutcome> {
+  for (let attempt = 0; ; attempt++) {
+    if (gen !== generation) return 'aborted';
     const refreshToken = await AsyncStorage.getItem(AUTH_REFRESH_TOKEN_KEY);
-    if (!refreshToken) return false;
+    if (gen !== generation) return 'aborted';
+    // 更新できる token が無い。何も変えない
+    if (!refreshToken) return 'aborted';
+    const authUrl = config?.authUrl;
+    if (!authUrl) return 'aborted';
 
-    const authHost = getAuthHost();
-    const response = await fetchWithTimeout(
-      `${config.authUrl}/api/auth/refresh`,
-      {
+    let response: Response | null = null;
+    try {
+      response = await fetchWithTimeout(`${authUrl}/api/auth/refresh`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           refreshToken,
-          hostname: authHost,
+          hostname: getAuthHost(),
         }),
-      },
-    );
-
-    if (!response.ok) {
-      await clearAuth();
-      return false;
+      });
+    } catch {
+      /* ネットワーク断・タイムアウト: 一時的な失敗として扱う */
     }
 
-    const data = await response.json();
-    await saveAuth(data.accessToken, data.refreshToken, data.expiresIn);
-    return true;
-  } catch {
-    await clearAuth();
-    return false;
+    // 通信中のログアウト・再ログインがあれば、結果を保存も消去もせず中止する。
+    // 以降の保存・消去は、この確認の直後(await を挟まず)に始める
+    if (gen !== generation) return 'aborted';
+
+    if (response?.ok) {
+      let data: { accessToken?: unknown; refreshToken?: unknown; expiresIn?: unknown } | null;
+      try {
+        data = await response.json();
+      } catch {
+        return finishTransient(gen);
+      }
+      // 本文の読み取り中にもログアウト・再ログインがありうるので、保存の直前に再確認する
+      if (gen !== generation) return 'aborted';
+      if (
+        typeof data?.accessToken !== 'string' ||
+        typeof data.refreshToken !== 'string' ||
+        typeof data.expiresIn !== 'number'
+      ) {
+        // 応答の形が想定外: token は消さず、一時的な失敗として扱う
+        return finishTransient(gen);
+      }
+      transientReschedules = 0;
+      await saveAuth(data.accessToken, data.refreshToken, data.expiresIn);
+      return 'ok';
+    }
+
+    // 一時的でない失敗(401・400・404 等の再試行しても直らない 4xx)は token を消す
+    if (response && !isTransientStatus(response.status)) {
+      await clearAuth();
+      return 'invalid';
+    }
+
+    // 429・408・5xx・ネットワーク断: token を保持して待ち、再試行する
+    if (attempt >= MAX_REFRESH_RETRIES) return finishTransient(gen);
+    await sleep(await computeWaitMs(response, attempt));
   }
+}
+
+/** 再試行を使い切った一時的な失敗。token は保持し、回数上限内なら後で改めて refresh する */
+function finishTransient(gen: number): RefreshOutcome {
+  if (gen !== generation) return 'aborted';
+  if (transientReschedules < MAX_TRANSIENT_RESCHEDULES) {
+    transientReschedules++;
+    scheduleRefreshIn(TRANSIENT_RESCHEDULE_MS);
+  }
+  return 'transient';
 }
 
 async function saveAuth(
@@ -161,13 +272,22 @@ async function saveAuth(
   accessToken = token;
   const expiresAt = Math.floor(Date.now() / 1000) + expiresIn;
 
+  // 次の refresh の予約は、ストレージの書き込みを待つ前に行う。
+  // 書き込み中にログアウトされたとき、ログアウトのタイマー解除が後から効くようにするため
+  scheduleRefresh(expiresAt);
+
   await Promise.all([
     AsyncStorage.setItem(AUTH_ACCESS_TOKEN_KEY, token),
     AsyncStorage.setItem(AUTH_REFRESH_TOKEN_KEY, refreshToken),
     AsyncStorage.setItem(AUTH_EXPIRES_AT_KEY, String(expiresAt)),
   ]);
+}
 
-  scheduleRefresh(expiresAt);
+function scheduleRefreshIn(delayMs: number): void {
+  if (refreshTimerId) clearTimeout(refreshTimerId);
+  refreshTimerId = setTimeout(() => {
+    performRefresh().catch(() => undefined);
+  }, delayMs);
 }
 
 function scheduleRefresh(expiresAt: number): void {
@@ -176,11 +296,7 @@ function scheduleRefresh(expiresAt: number): void {
   const delayMs =
     (expiresAt - REFRESH_BUFFER_SECONDS - Date.now() / 1000) * 1000;
 
-  if (delayMs > 0) {
-    refreshTimerId = setTimeout(() => {
-      performRefresh();
-    }, delayMs);
-  }
+  if (delayMs > 0) scheduleRefreshIn(delayMs);
 }
 
 async function clearAuth(): Promise<void> {
@@ -243,6 +359,8 @@ export const FeedbackService = {
       const data = await response.json();
       if (data.requiresTwoFactor) return '2FA required';
 
+      // 進行中の refresh が、旧い結果で新しいログインを上書き・消去しないようにする
+      generation++;
       await saveAuth(data.accessToken, data.refreshToken, data.expiresIn);
       return null;
     } catch (e) {
@@ -251,17 +369,37 @@ export const FeedbackService = {
   },
 
   async logout(): Promise<void> {
-    if (config?.authUrl && accessToken) {
+    // 進行中の再試行(待機中を含む)が、待機明けに token を書き戻さないようにする
+    generation++;
+    const bearer = accessToken;
+    accessToken = null;
+    if (refreshTimerId) {
+      clearTimeout(refreshTimerId);
+      refreshTimerId = null;
+    }
+
+    // サーバーが refresh token の系列ごと失効できるよう、保存済みの refresh token を送る
+    let refreshToken: string | null = null;
+    try {
+      refreshToken = await AsyncStorage.getItem(AUTH_REFRESH_TOKEN_KEY);
+    } catch { /* 読めなくても、ログアウトは続行する */ }
+
+    // ログアウト API の応答待ちの間に refresh が token を書き戻さないよう、先に消す
+    await clearAuth();
+
+    if (config?.authUrl && (bearer || refreshToken)) {
+      const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+      if (bearer) headers['Authorization'] = `Bearer ${bearer}`;
       try {
         await fetchWithTimeout(`${config.authUrl}/api/auth/logout`, {
           method: 'POST',
-          headers: buildHeaders(),
+          headers,
+          body: JSON.stringify(refreshToken ? { refreshToken } : {}),
         });
       } catch {
         // Server-side logout failure is non-critical
       }
     }
-    await clearAuth();
   },
 
   async getSessionInfo(): Promise<SessionInfo> {
