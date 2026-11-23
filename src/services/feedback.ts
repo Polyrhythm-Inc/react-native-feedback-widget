@@ -126,12 +126,15 @@ function buildHeaders(): Record<string, string> {
 }
 
 async function loadSavedAuth(): Promise<void> {
+  // 読み取りの間にログアウト・再ログインがあれば、旧い値を復元しない(S-301)
+  const gen = generation;
   try {
     const [saved, expiresAtStr] = await Promise.all([
       AsyncStorage.getItem(AUTH_ACCESS_TOKEN_KEY),
       AsyncStorage.getItem(AUTH_EXPIRES_AT_KEY),
     ]);
 
+    if (gen !== generation) return;
     if (!saved || !expiresAtStr) return;
 
     const expiresAt = parseInt(expiresAtStr, 10);
@@ -142,7 +145,7 @@ async function loadSavedAuth(): Promise<void> {
       scheduleRefresh(expiresAt);
     }
   } catch {
-    await clearAuth();
+    if (gen === generation) await clearAuth();
   }
 }
 
@@ -183,8 +186,8 @@ function performRefresh(): Promise<RefreshOutcome> {
   if (refreshInFlight && refreshInFlight.gen === gen) return refreshInFlight.promise;
 
   const promise: Promise<RefreshOutcome> = refreshWithRetries(gen)
-    // ストレージ障害などの想定外の例外では token を消さず、一時的な失敗として扱う
-    .catch((): RefreshOutcome => 'transient')
+    // ストレージ障害などの想定外の例外では token を消さず、一時的な失敗として扱う(再試行も予約する)
+    .catch((): RefreshOutcome => finishTransient(gen))
     .finally(() => {
       if (refreshInFlight?.promise === promise) refreshInFlight = null;
     });
@@ -283,6 +286,25 @@ async function saveAuth(
   ]);
 }
 
+/**
+ * ログアウト API へ refresh token(と access token)を送り、サーバー側で系列ごと失効させる。
+ * 失敗は握りつぶす(手元の token は先に消えている)。
+ */
+async function postLogout(bearer: string | null, refreshToken: string | null): Promise<void> {
+  if (!config?.authUrl) return;
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+  if (bearer) headers['Authorization'] = `Bearer ${bearer}`;
+  try {
+    await fetchWithTimeout(`${config.authUrl}/api/auth/logout`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(refreshToken ? { refreshToken } : {}),
+    });
+  } catch {
+    // Server-side logout failure is non-critical
+  }
+}
+
 function scheduleRefreshIn(delayMs: number): void {
   if (refreshTimerId) clearTimeout(refreshTimerId);
   refreshTimerId = setTimeout(() => {
@@ -359,9 +381,21 @@ export const FeedbackService = {
       const data = await response.json();
       if (data.requiresTwoFactor) return '2FA required';
 
+      // 再ログインで旧い系列がサーバーに残らないよう、保存済みの旧い refresh token を控えておく(S-303)
+      let previousRefreshToken: string | null = null;
+      try {
+        previousRefreshToken = await AsyncStorage.getItem(AUTH_REFRESH_TOKEN_KEY);
+      } catch { /* 読めなければ、失効は諦める */ }
+
       // 進行中の refresh が、旧い結果で新しいログインを上書き・消去しないようにする
       generation++;
+      transientReschedules = 0;
       await saveAuth(data.accessToken, data.refreshToken, data.expiresIn);
+
+      if (previousRefreshToken && previousRefreshToken !== data.refreshToken) {
+        // ログインの応答は待たせない
+        postLogout(null, previousRefreshToken).catch(() => undefined);
+      }
       return null;
     } catch (e) {
       return e instanceof Error ? e.message : 'Login failed';
@@ -387,19 +421,7 @@ export const FeedbackService = {
     // ログアウト API の応答待ちの間に refresh が token を書き戻さないよう、先に消す
     await clearAuth();
 
-    if (config?.authUrl && (bearer || refreshToken)) {
-      const headers: Record<string, string> = { 'Content-Type': 'application/json' };
-      if (bearer) headers['Authorization'] = `Bearer ${bearer}`;
-      try {
-        await fetchWithTimeout(`${config.authUrl}/api/auth/logout`, {
-          method: 'POST',
-          headers,
-          body: JSON.stringify(refreshToken ? { refreshToken } : {}),
-        });
-      } catch {
-        // Server-side logout failure is non-critical
-      }
-    }
+    if (bearer || refreshToken) await postLogout(bearer, refreshToken);
   },
 
   async getSessionInfo(): Promise<SessionInfo> {
