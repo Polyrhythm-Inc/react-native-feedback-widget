@@ -69,6 +69,8 @@ let refreshTimerId: ReturnType<typeof setTimeout> | null = null;
 /** logout・再ログインで増やす世代番号。進行中の refresh が古い世代の結果を保存・消去しないために使う */
 let generation = 0;
 let transientReschedules = 0;
+/** 実行中のログアウトの数。ログアウトが先に始まった間は、起動時の復元で token をメモリへ戻さない (S-301R) */
+let logoutsInProgress = 0;
 /** 進行中の refresh。タイマー・起動時の復元・configure の再呼び出しが重なっても、API は 1 本にまとめる */
 let refreshInFlight: { gen: number; promise: Promise<RefreshOutcome> } | null = null;
 
@@ -126,7 +128,10 @@ function buildHeaders(): Record<string, string> {
 }
 
 async function loadSavedAuth(): Promise<void> {
-  // 読み取りの間にログアウト・再ログインがあれば、旧い値を復元しない(S-301)
+  // 読み取りの間にログアウト・再ログインがあれば、旧い値を復元しない(S-301)。
+  // ログアウトが先に始まっている場合は、世代番号は更新済みでストレージは消去前の値のまま読めるため、
+  // 実行中のログアウトの印を、読み取りの前に確かめる(S-301R)
+  if (logoutsInProgress > 0) return;
   const gen = generation;
   try {
     const [saved, expiresAtStr] = await Promise.all([
@@ -334,6 +339,28 @@ async function clearAuth(): Promise<void> {
   ]);
 }
 
+async function performLogout(): Promise<void> {
+  // 進行中の再試行(待機中を含む)が、待機明けに token を書き戻さないようにする
+  generation++;
+  const bearer = accessToken;
+  accessToken = null;
+  if (refreshTimerId) {
+    clearTimeout(refreshTimerId);
+    refreshTimerId = null;
+  }
+
+  // サーバーが refresh token の系列ごと失効できるよう、保存済みの refresh token を送る
+  let refreshToken: string | null = null;
+  try {
+    refreshToken = await AsyncStorage.getItem(AUTH_REFRESH_TOKEN_KEY);
+  } catch { /* 読めなくても、ログアウトは続行する */ }
+
+  // ログアウト API の応答待ちの間に refresh が token を書き戻さないよう、先に消す
+  await clearAuth();
+
+  if (bearer || refreshToken) await postLogout(bearer, refreshToken);
+}
+
 export const FeedbackService = {
   configure(cfg: FeedbackConfig): void {
     config = cfg;
@@ -381,10 +408,15 @@ export const FeedbackService = {
       const data = await response.json();
       if (data.requiresTwoFactor) return '2FA required';
 
-      // 再ログインで旧い系列がサーバーに残らないよう、保存済みの旧い refresh token を控えておく(S-303)
+      // 再ログインで旧い系列がサーバーに残らないよう、保存済みの旧い refresh token と access token を控えておく(S-303)。
+      // access token は、失効要求に Bearer で付けるために要る(R-101)
       let previousRefreshToken: string | null = null;
+      let previousAccessToken: string | null = null;
       try {
-        previousRefreshToken = await AsyncStorage.getItem(AUTH_REFRESH_TOKEN_KEY);
+        [previousRefreshToken, previousAccessToken] = await Promise.all([
+          AsyncStorage.getItem(AUTH_REFRESH_TOKEN_KEY),
+          AsyncStorage.getItem(AUTH_ACCESS_TOKEN_KEY),
+        ]);
       } catch { /* 読めなければ、失効は諦める */ }
 
       // 進行中の refresh が、旧い結果で新しいログインを上書き・消去しないようにする
@@ -392,9 +424,12 @@ export const FeedbackService = {
       transientReschedules = 0;
       await saveAuth(data.accessToken, data.refreshToken, data.expiresIn);
 
-      if (previousRefreshToken && previousRefreshToken !== data.refreshToken) {
+      // 旧い access token を Bearer で付けて送る。Bearer があればサーバーは token 経路で終わり、cookie には触れない
+      // (期限切れの token でも同じ)。Bearer なしだと cookie 経路に入り、ログイン API が cookie に設定した
+      // 新しいセッションと系列を消すおそれがある(R-101)。旧い access token が無ければ、失効は送らない。
+      if (previousRefreshToken && previousAccessToken && previousRefreshToken !== data.refreshToken) {
         // ログインの応答は待たせない
-        postLogout(null, previousRefreshToken).catch(() => undefined);
+        postLogout(previousAccessToken, previousRefreshToken).catch(() => undefined);
       }
       return null;
     } catch (e) {
@@ -403,25 +438,13 @@ export const FeedbackService = {
   },
 
   async logout(): Promise<void> {
-    // 進行中の再試行(待機中を含む)が、待機明けに token を書き戻さないようにする
-    generation++;
-    const bearer = accessToken;
-    accessToken = null;
-    if (refreshTimerId) {
-      clearTimeout(refreshTimerId);
-      refreshTimerId = null;
-    }
-
-    // サーバーが refresh token の系列ごと失効できるよう、保存済みの refresh token を送る
-    let refreshToken: string | null = null;
+    // 印は同期的に立てる(最初の await より前)。復元が、消去の前の値を読んでメモリへ戻さないようにする(S-301R)
+    logoutsInProgress++;
     try {
-      refreshToken = await AsyncStorage.getItem(AUTH_REFRESH_TOKEN_KEY);
-    } catch { /* 読めなくても、ログアウトは続行する */ }
-
-    // ログアウト API の応答待ちの間に refresh が token を書き戻さないよう、先に消す
-    await clearAuth();
-
-    if (bearer || refreshToken) await postLogout(bearer, refreshToken);
+      await performLogout();
+    } finally {
+      logoutsInProgress--;
+    }
   },
 
   async getSessionInfo(): Promise<SessionInfo> {

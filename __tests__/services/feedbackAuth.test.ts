@@ -4,7 +4,7 @@ type Svc = typeof import('../../src/services/feedback').FeedbackService;
 const mockStorage: Record<string, string> = {};
 const mockGetItem = jest.fn<Promise<string | null>, [string]>((key) => Promise.resolve(mockStorage[key] ?? null));
 /** setItem の完了を遅らせて、「保存の書き込み中」に別の操作を割り込ませるためのゲート */
-const mockGate: { setItem: Promise<void> | null } = { setItem: null };
+const mockGate: { setItem: Promise<void> | null; removeItem: Promise<void> | null } = { setItem: null, removeItem: null };
 jest.mock('@react-native-async-storage/async-storage', () => ({
   getItem: (key: string) => mockGetItem(key),
   setItem: jest.fn((key: string, value: string) => {
@@ -12,7 +12,11 @@ jest.mock('@react-native-async-storage/async-storage', () => ({
     return mockGate.setItem ?? Promise.resolve();
   }),
   removeItem: jest.fn((key: string) => {
-    delete mockStorage[key];
+    const done = () => {
+      delete mockStorage[key];
+    };
+    if (mockGate.removeItem) return mockGate.removeItem.then(done); // 消去を遅らせる(その間、旧い値が読める)
+    done();
     return Promise.resolve();
   }),
 }));
@@ -80,6 +84,7 @@ beforeEach(() => {
   fetchMock.mockReset();
   mockGetItem.mockClear();
   mockGate.setItem = null;
+  mockGate.removeItem = null;
   Object.keys(mockStorage).forEach((k) => delete mockStorage[k]);
 });
 
@@ -604,6 +609,105 @@ describe('起動時の復元とログアウトの競合 (S-301)', () => {
   });
 });
 
+describe('ログアウトが先に始まっている場合の復元 (S-301R)', () => {
+  test('ログアウトの消去が終わる前に復元が始まっても、旧い値を復元しない', async () => {
+    const svc = await start();
+    await flush();
+    mockStorage[K.access] = 'a1';
+    mockStorage[K.refresh] = 'r1';
+    mockStorage[K.expires] = String(nowSec() + 3600);
+    const removeGate = deferred<void>();
+    mockGate.removeItem = removeGate.promise;
+    fetchMock.mockResolvedValueOnce(res(200, {})); // logout API
+
+    const loggingOut = svc.logout();
+    await flush();
+    expect(mockStorage[K.access]).toBe('a1'); // まだ消えていない
+
+    svc.configure({ apiUrl: 'https://api.example.com', projectId: 'p', authUrl: AUTH_URL }); // 復元が始まる
+    await flush();
+    expect(svc.isAuthenticated).toBe(false);
+
+    removeGate.resolve();
+    await loggingOut;
+    await flush();
+
+    expect(svc.isAuthenticated).toBe(false);
+    expect(mockStorage).toEqual({});
+    expect(jest.getTimerCount()).toBe(0);
+  });
+
+  test('ログアウトの進行中に始まった復元が、読み取り中にログアウトの完了を迎えても、旧い値を戻さない', async () => {
+    const svc = await start();
+    await flush();
+    mockStorage[K.access] = 'a1';
+    mockStorage[K.refresh] = 'r1';
+    mockStorage[K.expires] = String(nowSec() + 3600);
+    const removeGate = deferred<void>();
+    const readGate = deferred<string | null>();
+    mockGate.removeItem = removeGate.promise;
+    fetchMock.mockResolvedValueOnce(res(200, {})); // logout API
+    const loggingOut = svc.logout();
+    await flush();
+
+    let gated = false;
+    mockGetItem.mockImplementation((key: string) => {
+      if (key === K.access && !gated) {
+        gated = true;
+        return readGate.promise; // 復元が読み始めた旧い値
+      }
+      return Promise.resolve(mockStorage[key] ?? null);
+    });
+    svc.configure({ apiUrl: 'https://api.example.com', projectId: 'p', authUrl: AUTH_URL });
+    await flush();
+
+    removeGate.resolve();
+    await loggingOut; // ログアウトが完了(印は下りた。世代番号は復元の開始前から変わっていない)
+    readGate.resolve('a1');
+    await flush();
+    mockGetItem.mockImplementation((key: string) => Promise.resolve(mockStorage[key] ?? null));
+
+    expect(svc.isAuthenticated).toBe(false);
+    expect(jest.getTimerCount()).toBe(0);
+  });
+
+  test('ログアウトが例外で終わっても印は下りる(その後の復元はできる)', async () => {
+    const svc = await start();
+    await flush();
+    mockStorage[K.refresh] = 'r-old';
+    mockGate.removeItem = Promise.reject(new Error('storage down')); // 消去の失敗
+    await expect(svc.logout()).rejects.toThrow('storage down');
+    mockGate.removeItem = null;
+    Object.keys(mockStorage).forEach((k) => delete mockStorage[k]);
+    mockStorage[K.access] = 'a9';
+    mockStorage[K.refresh] = 'r9';
+    mockStorage[K.expires] = String(nowSec() + 3600);
+
+    svc.configure({ apiUrl: 'https://api.example.com', projectId: 'p', authUrl: AUTH_URL });
+    await flush();
+
+    expect(svc.isAuthenticated).toBe(true);
+  });
+});
+
+describe('refresh 成功で、一時的な失敗の通算回数(再スケジュールの上限)が戻る (R-102)', () => {
+  test('3 回再スケジュールした後に成功すると、上限が戻り、再び 5 回まで再試行できる', async () => {
+    seedExpired();
+    let n = 0;
+    fetchMock.mockImplementation(async () => {
+      n++;
+      if (n === 13) return res(200, { accessToken: 'a2', refreshToken: 'r2', expiresIn: 301 }); // 4 回目の refresh の初回で成功
+      throw new TypeError('Network request failed');
+    });
+    await start();
+    await jest.advanceTimersByTimeAsync(60 * 60 * 1000);
+
+    // 失敗 3 回の refresh(各 4 回)= 12、成功 1 回 = 13、その後の失敗は、上限が戻っていれば 6 回の refresh × 4 回 = 24
+    expect(fetchMock).toHaveBeenCalledTimes(13 + 24);
+    expect(jest.getTimerCount()).toBe(0);
+  });
+});
+
 describe('再ログインで旧い系列を失効させる (S-303)', () => {
   const logoutCalls = () => callsTo('/api/auth/logout');
   const NEW_LOGIN = { accessToken: 'a-new', refreshToken: 'r-new', expiresIn: 900 };
@@ -622,6 +726,41 @@ describe('再ログインで旧い系列を失効させる (S-303)', () => {
     expect(mockStorage[K.refresh]).toBe('r-new');
     expect(logoutCalls()).toHaveLength(1);
     expect(JSON.parse(logoutCalls()[0][1].body)).toEqual({ refreshToken: 'r-old' });
+    // 旧い access token を Bearer で付ける (R-101: Bearer なしだと cookie 経路に入り、新しいログインのセッションを消すおそれ)
+    expect(logoutCalls()[0][1].headers).toEqual({ 'Content-Type': 'application/json', Authorization: 'Bearer a-old' });
+  });
+
+  test('旧い access token が期限切れでも Bearer で送る(token 経路に入り、cookie に触れない)', async () => {
+    mockStorage[K.access] = 'a-expired';
+    mockStorage[K.refresh] = 'r-old';
+    mockStorage[K.expires] = String(nowSec() - 100);
+    mockGetItem.mockImplementation((key: string) => Promise.resolve(mockStorage[key] ?? null));
+    const svc = await start();
+    // 起動時の refresh(期限切れ)を一時的に失敗させ、旧い token を残したまま再ログインする
+    fetchMock.mockRejectedValue(new TypeError('Network request failed'));
+    await flush();
+    fetchMock.mockReset();
+    fetchMock.mockResolvedValueOnce(res(200, NEW_LOGIN)).mockResolvedValueOnce(res(200, {}));
+
+    await svc.login('u@example.com', 'pw');
+    await flush();
+
+    expect(logoutCalls()).toHaveLength(1);
+    expect(logoutCalls()[0][1].headers.Authorization).toBe('Bearer a-expired');
+  });
+
+  test('旧い access token が無ければ、失効の要求は送らない(Bearer なしで cookie 経路に入らない)', async () => {
+    mockStorage[K.refresh] = 'r-old';
+    const svc = await start();
+    await flush();
+    fetchMock.mockReset();
+    fetchMock.mockResolvedValueOnce(res(200, NEW_LOGIN));
+
+    await svc.login('u@example.com', 'pw');
+    await flush();
+
+    expect(mockStorage[K.refresh]).toBe('r-new');
+    expect(logoutCalls()).toHaveLength(0);
   });
 
   test('初回ログイン(旧い token が無い)では送らない', async () => {
@@ -633,6 +772,7 @@ describe('再ログインで旧い系列を失効させる (S-303)', () => {
   });
 
   test('旧い token が新しい値と同じなら送らない(自分の系列を失効させない)', async () => {
+    mockStorage[K.access] = 'a-old'; // 旧い access token もある状態で、refresh token だけが同じ
     mockStorage[K.refresh] = 'r-new';
     const svc = await start();
     fetchMock.mockResolvedValueOnce(res(200, NEW_LOGIN));
@@ -642,6 +782,7 @@ describe('再ログインで旧い系列を失効させる (S-303)', () => {
   });
 
   test('失効の要求が失敗しても、ログインは成功する', async () => {
+    mockStorage[K.access] = 'a-old';
     mockStorage[K.refresh] = 'r-old';
     const svc = await start();
     fetchMock.mockResolvedValueOnce(res(200, NEW_LOGIN)).mockRejectedValueOnce(new TypeError('Network request failed'));
